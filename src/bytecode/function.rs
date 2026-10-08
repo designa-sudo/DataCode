@@ -14,6 +14,10 @@ pub struct CapturedVar {
     pub parent_slot_index: usize, // Slot index in ancestor function's frame
     pub local_slot_index: usize,  // Slot index in this function's frame
     pub ancestor_depth: usize,    // Depth of ancestor (0 = immediate parent, 1 = grandparent, etc.)
+    /// Index in VM `functions` for the frame where `parent_slot_index` is valid (the enclosing
+    /// function at **definition** time). `usize::MAX` = legacy: use `ancestor_depth` from the call stack
+    /// (breaks recursive closures); kept for old `.dcb` and edge cases without an enclosing function.
+    pub parent_function_index: usize,
 }
 
 /// Ключ для кэша функции - оптимизирован для разных случаев
@@ -37,12 +41,10 @@ impl CacheKey {
 
         // Оптимизация для двух чисел (частый случай для Ackermann)
         if args.len() == 2 {
-            if let (Value::Number(m), Value::Number(n)) = (&args[0], &args[1]) {
-                // Преобразуем f64 в i64, если возможно (для целых чисел)
-                let m_int = *m as i64;
-                let n_int = *n as i64;
-                // Проверяем, что преобразование было точным (целые числа)
-                if (m_int as f64) == *m && (n_int as f64) == *n {
+            if let (Some(m), Some(n)) = (args[0].as_finite_f64(), args[1].as_finite_f64()) {
+                let m_int = m as i64;
+                let n_int = n as i64;
+                if (m_int as f64) == m && (n_int as f64) == n {
                     return Some(CacheKey::TwoNumbers(m_int, n_int));
                 }
             }
@@ -117,10 +119,16 @@ pub struct Function {
     /// Web route: (method, path) from @route("METHOD", "/path")
     pub route_method: Option<String>,
     pub route_path: Option<String>,
+    /// WebSocket message type from @ws_route("type")
+    pub ws_route_type: Option<String>,
     /// Module this function belongs to (e.g. "core.config", "__main__"). None = legacy single global space.
     pub module_name: Option<String>,
     /// `stream fn` — тело компилируется с yield; вызов возвращает [`crate::common::value::Value::Generator`].
     pub is_stream: bool,
+    /// Индекс параметра `*args` в `param_names`, если объявлен.
+    pub variadic_pos_index: Option<usize>,
+    /// Индекс параметра `**kwargs` в `param_names`, если объявлен.
+    pub variadic_kw_index: Option<usize>,
 }
 
 impl Function {
@@ -138,8 +146,11 @@ impl Function {
             cache: None,
             route_method: None,
             route_path: None,
+            ws_route_type: None,
             module_name: None,
             is_stream: false,
+            variadic_pos_index: None,
+            variadic_kw_index: None,
         }
     }
 
@@ -157,8 +168,11 @@ impl Function {
             cache: Some(Rc::new(RefCell::new(FnCache::new()))),
             route_method: None,
             route_path: None,
+            ws_route_type: None,
             module_name: None,
             is_stream: false,
+            variadic_pos_index: None,
+            variadic_kw_index: None,
         }
     }
 }
@@ -178,8 +192,11 @@ impl Clone for Function {
             cache: self.cache.clone(),
             route_method: self.route_method.clone(),
             route_path: self.route_path.clone(),
+            ws_route_type: self.ws_route_type.clone(),
             module_name: self.module_name.clone(),
             is_stream: self.is_stream,
+            variadic_pos_index: self.variadic_pos_index,
+            variadic_kw_index: self.variadic_kw_index,
         }
     }
 }

@@ -4,7 +4,7 @@ use crate::common::value_store::{ValueCell, ValueStore};
 use crate::vm::global_slot::{default_global_slot, GlobalSlot};
 
 /// Количество встроенных глобалов (индексы `0..BUILTIN_GLOBAL_COUNT`).
-pub const BUILTIN_GLOBAL_COUNT: usize = 85;
+pub const BUILTIN_GLOBAL_COUNT: usize = 117;
 
 /// Канонические имена встроенных глобалов по индексу `0..BUILTIN_GLOBAL_COUNT` (для legacy `legacy_merge::merge_globals_from`: не перезаписывать правильное значение ошибочным).
 pub const BUILTIN_GLOBAL_NAMES: [&str; BUILTIN_GLOBAL_COUNT] = [
@@ -35,14 +35,20 @@ pub const BUILTIN_GLOBAL_NAMES: [&str; BUILTIN_GLOBAL_COUNT] = [
     "min",
     "max",
     "round",
+    "ceil",
+    "floor",
     "upper",
     "lower",
     "trim",
     "split",
     "join",
     "contains",
+    "starts_with",
+    "ends_with",
     "isupper",
     "islower",
+    "replace",
+    "capitalize",
     "push",
     "pop",
     "unique",
@@ -62,6 +68,14 @@ pub const BUILTIN_GLOBAL_NAMES: [&str; BUILTIN_GLOBAL_COUNT] = [
     "table_select",
     "table_sort",
     "table_where",
+    "table_drop_nulls",
+    "table_replace_nulls",
+    "table_rename",
+    "table_drop_column",
+    "table_add_column",
+    "table_map",
+    "table_split_column",
+    "table_join_columns",
     "show_table",
     "merge_tables",
     "now",
@@ -93,6 +107,24 @@ pub const BUILTIN_GLOBAL_NAMES: [&str; BUILTIN_GLOBAL_COUNT] = [
     "hmac_sha512",
     "random_bytes",
     "random_int",
+    "random_seed",
+    "random",
+    "date_to_unix",
+    "parse_date",
+    "format_date",
+    "duration",
+    "set",
+    "divmod",
+    "isinf",
+    "copy",
+    "ord",
+    "table_row_number",
+    "table_distinct",
+    "table_value_map",
+    "table_aggregate",
+    "table_aggregate_group",
+    "archive",
+    "datasource",
 ];
 
 /// Возвращает каноническое имя встроенной глобальной переменной по индексу (`0..BUILTIN_GLOBAL_COUNT`).
@@ -100,9 +132,23 @@ pub fn builtin_global_name(index: usize) -> Option<&'static str> {
     (index < BUILTIN_GLOBAL_COUNT).then(|| BUILTIN_GLOBAL_NAMES[index])
 }
 
+/// Additive builtins registered above `BUILTIN_GLOBAL_COUNT` (chunk global index != native index).
+pub fn extended_builtin_native_index(name: &str) -> Option<usize> {
+    use crate::vm::native_indices::builtin;
+    match name {
+        "read" => Some(builtin::READ_FILE),
+        "save" => Some(builtin::SAVE),
+        "save_tables_sqlite" => Some(builtin::SAVE_TABLES_SQLITE),
+        _ => None,
+    }
+}
+
 /// Возвращает канонический индекс встроенной глобальной переменной по имени (для set_functions).
 pub fn builtin_global_index(name: &str) -> Option<usize> {
-    BUILTIN_GLOBAL_NAMES.iter().position(|&n| n == name)
+    BUILTIN_GLOBAL_NAMES
+        .iter()
+        .position(|&n| n == name)
+        .or_else(|| extended_builtin_native_index(name))
 }
 
 /// Регистрирует нативные функции в глобальных переменных (GlobalSlot::Heap(ValueId))
@@ -129,6 +175,11 @@ pub fn register_native_globals(
 
 /// Заполняет имена глобальных переменных из chunk.
 /// Does not overwrite: (1) builtin slots below `BUILTIN_GLOBAL_COUNT` with a different name; (2) any existing name; (3) never insert at idx >= `BUILTIN_GLOBAL_COUNT` (VM already has high slots from ensure_globals_from_chunk).
+///
+/// Explicit globals (`global x = …`) are keyed by **VM slot** resolved from `global_names` by
+/// name — not by the compiler/chunk index. Chunk indices for user vars are always
+/// `>= BUILTIN_GLOBAL_COUNT`, so inserting at the chunk index would either be skipped or
+/// point at the wrong slot (breaking SQLite `_datacode_variables` and `relate()` name lookup).
 pub fn merge_global_names(
     global_names: &mut std::collections::BTreeMap<usize, String>,
     explicit_global_names: &mut std::collections::BTreeMap<usize, String>,
@@ -153,18 +204,23 @@ pub fn merge_global_names(
         }
         global_names.insert(*idx, name.clone());
     }
-    for (idx, name) in chunk_explicit_global_names {
-        if *idx >= BUILTIN_END {
-            continue;
-        }
-        if let Some(existing) = explicit_global_names.get(idx) {
-            if existing != name {
-                continue;
-            }
-        }
+    for (_chunk_idx, name) in chunk_explicit_global_names {
         if explicit_global_names.values().any(|n| n == name) {
             continue;
         }
-        explicit_global_names.insert(*idx, name.clone());
+        let matching: Vec<usize> = global_names
+            .iter()
+            .filter(|(_, n)| *n == name)
+            .map(|(idx, _)| *idx)
+            .collect();
+        let vm_idx = matching
+            .iter()
+            .copied()
+            .filter(|&idx| idx >= BUILTIN_END)
+            .min()
+            .or_else(|| matching.into_iter().min());
+        if let Some(idx) = vm_idx {
+            explicit_global_names.insert(idx, name.clone());
+        }
     }
 }

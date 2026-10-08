@@ -1,0 +1,19 @@
+# Restrict DCP execute sandbox + custom JSON routes
+from websocket import configure, disable_builtin
+
+configure({"execute_policy": "restricted"})
+
+# Optional: disable SMB built-in handlers
+# disable_builtin("smb_connect")
+
+@ws_route("ping")
+fn ping(req) {
+    return {"success": true, "message": "pong"}
+}
+
+@ws_route("version")
+fn version(req) {
+    return {"success": true, "version": "1.0", "app": "ws_app.dc"}
+}
+
+print("WebSocket app configured")

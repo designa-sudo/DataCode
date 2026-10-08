@@ -1,0 +1,26 @@
+# Ограничение sandbox для DCP + пользовательские JSON-маршруты
+# Запуск:
+#   datacode dc/ws_app.dc --websocket --host 0.0.0.0 --port 8899
+
+from websocket import configure, disable_builtin
+
+configure({"execute_policy": "restricted"})
+
+# disable_builtin("smb_connect")
+
+@ws_route("ping")
+fn ping(req) {
+    return {"success": true, "message": "pong"}
+}
+
+@ws_route("version")
+fn version(req) {
+    return {"success": true, "version": "1.0", "app": "ws_app.dc"}
+}
+
+@ws_route("health")
+fn health(req) {
+    return {"success": true, "status": "ok"}
+}
+
+print("WebSocket-приложение настроено: маршруты ping, version, health")

@@ -4,10 +4,15 @@ use crate::common::value::Value;
 use crate::database_engine::sqenum;
 use crate::compiler::context::CompilationContext;
 use crate::compiler::expr;
+use crate::compiler::expr::call;
+use crate::compiler::nested_chunk;
+use crate::compiler::special_methods::{
+    validate_init_matches_constructor, validate_special_method_signature,
+};
 use crate::compiler::stmt;
 /// Компиляция class statements
 use crate::debug_println;
-use crate::parser::ast::{Arg, ClassField, Expr, Param, Stmt, TypePart};
+use crate::parser::ast::{Arg, ClassField, Expr, Method, Param, Stmt, TypePart};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -18,6 +23,66 @@ use std::rc::Rc;
 pub const MODEL_CONFIG_CLASS_LOAD_INDEX: usize = 0x0FFF_FFFF;
 /// Global name for the slot the VM sets to the class being constructed (leaf class).
 pub const CONSTRUCTING_CLASS_GLOBAL_NAME: &str = "__constructing_class__";
+
+/// Build `default_values` for a class method: leading `None` for `this` (and `@class` if present),
+/// then compile-time constants for user parameters that have defaults.
+fn method_default_values(
+    user_params: &[&Param],
+    has_at_class: bool,
+    bindings: &HashMap<String, Value>,
+    source_name: Option<&str>,
+) -> Result<Vec<Option<Value>>, LangError> {
+    let signature_param_names: Vec<String> = user_params.iter().map(|p| p.name.clone()).collect();
+    let mut default_values = Vec::with_capacity(1 + (has_at_class as usize) + user_params.len());
+    default_values.push(None); // this
+    if has_at_class {
+        default_values.push(None); // @class (injected by VM)
+    }
+    for param in user_params {
+        if let Some(ref default_expr) = param.default_value {
+            let constant_value = crate::compiler::defaults::resolve_default_param_value(
+                default_expr,
+                &param.name,
+                &signature_param_names,
+                bindings,
+                source_name,
+            )?;
+            default_values.push(Some(constant_value));
+        } else {
+            default_values.push(None);
+        }
+    }
+    Ok(default_values)
+}
+
+fn emit_special_init_call(
+    ctx: &mut CompilationContext,
+    line: usize,
+    this_slot: usize,
+    param_count: usize,
+    init_function_index: Option<usize>,
+) {
+    if init_function_index.is_none() {
+        return;
+    }
+    ctx.chunk.write_with_line(
+        OpCode::InvokeSpecialInit(this_slot, param_count),
+        line,
+    );
+}
+
+fn emit_constructor_return(
+    ctx: &mut CompilationContext,
+    line: usize,
+    this_slot: usize,
+    param_count: usize,
+    init_function_index: Option<usize>,
+) {
+    emit_special_init_call(ctx, line, this_slot, param_count, init_function_index);
+    ctx.chunk
+        .write_with_line(OpCode::LoadLocal(this_slot), line);
+    ctx.chunk.write_with_line(OpCode::Return, line);
+}
 
 /// Returns true if any field (private, protected, or public) has a default expression that is a call to "Column".
 /// Used to distinguish ORM models (User with Column(int, ...)) from Settings subclasses (Config(...), Field(...)).
@@ -37,15 +102,10 @@ fn has_column_field(
         || public_fields.iter().any(field_has_column_default)
 }
 
-/// True if any TypeName in the annotation satisfies the predicate (LiteralStr is ignored for type-name checks).
-fn type_parts_any(tys: Option<&Vec<TypePart>>, pred: impl Fn(&str) -> bool) -> bool {
-    tys.map(|tys| {
-        tys.iter().any(|t| match t {
-            TypePart::TypeName(s) => pred(s),
-            TypePart::LiteralStr(_) => false,
-        })
-    })
-    .unwrap_or(false)
+/// True if any TypeName/base in the annotation satisfies the predicate.
+fn type_parts_any(tys: Option<&Vec<TypePart>>, mut pred: impl FnMut(&str) -> bool) -> bool {
+    tys.map(|parts| TypePart::slice_walk_type_names(parts, &mut pred))
+        .unwrap_or(false)
 }
 
 /// Build type suffix for constructor/function overloading: "int_str_int" from params with type annotations.
@@ -55,10 +115,7 @@ fn param_types_suffix(params: &[Param]) -> Option<String> {
         .iter()
         .map(|p| {
             p.type_annotation.as_ref().and_then(|tys| {
-                tys.first().map(|t| match t {
-                    TypePart::TypeName(s) => s.clone(),
-                    TypePart::LiteralStr(s) => format!("\"{}\"", s),
-                })
+                tys.first().map(|t| t.format_display())
             })
         })
         .collect::<Option<Vec<_>>>()?;
@@ -201,7 +258,7 @@ fn emit_instance_private_metadata(
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect();
-    let defining_class_value = Value::Object(Rc::new(RefCell::new(defining_class_map)));
+    let defining_class_value = Value::legacy_object(defining_class_map);
     let defining_class_const = ctx.chunk.add_constant(defining_class_value);
     ctx.chunk
         .write_with_line(OpCode::Constant(defining_class_const), line);
@@ -233,20 +290,35 @@ fn emit_instance_private_metadata(
         .write_with_line(OpCode::StoreLocal(this_slot), line);
 }
 
+/// Callable expression treated as `Field(...)` for descriptor extraction (parse/import lowering).
+fn field_descriptor_call_args(expr: &Expr) -> Option<&Vec<Arg>> {
+    match expr {
+        Expr::Call { name, args, .. } if name == "Field" => Some(args),
+        Expr::CallValue { callee, args, .. } => match callee.as_ref() {
+            Expr::Variable { name, .. } if name == "Field" => Some(args),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Identifier used as `default_factory=...` (class name / callable reference).
+fn default_factory_factory_name_from_expr(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Variable { name, .. } => Some(name.clone()),
+        Expr::Property { name, .. } => Some(name.clone()),
+        _ => None,
+    }
+}
+
 /// Extract default_factory identifier from a field's default_value if it is Field(default_factory=Name).
 fn extract_default_factory_name(default_value: &Option<Expr>) -> Option<String> {
     let expr = default_value.as_ref()?;
-    let args = match expr {
-        Expr::Call { name, args, .. } if name == "Field" => args,
-        _ => return None,
-    };
+    let args = field_descriptor_call_args(expr)?;
     for arg in args {
         if let Arg::Named { name: n, value } = arg {
             if n == "default_factory" {
-                if let Expr::Variable { name, .. } = value {
-                    return Some(name.clone());
-                }
-                return None;
+                return default_factory_factory_name_from_expr(value);
             }
         }
     }
@@ -256,10 +328,7 @@ fn extract_default_factory_name(default_value: &Option<Expr>) -> Option<String> 
 /// Extract constant default from Field(default=<literal>) for instance field initialization.
 fn extract_field_default_value(default_value: &Option<Expr>) -> Option<Value> {
     let expr = default_value.as_ref()?;
-    let args = match expr {
-        Expr::Call { name, args, .. } if name == "Field" => args,
-        _ => return None,
-    };
+    let args = field_descriptor_call_args(expr)?;
     for arg in args {
         if let Arg::Named { name: n, value } = arg {
             if n == "default" {
@@ -289,10 +358,13 @@ fn extract_field_default_value(default_value: &Option<Expr>) -> Option<Value> {
 fn field_required_for_env(field: &ClassField) -> bool {
     match &field.default_value {
         None => true,
-        Some(Expr::Call { name, args, .. }) if name == "Field" && args.len() == 1 => {
-            matches!(&args[0], Arg::Positional(Expr::Ellipsis { .. }))
+        Some(expr) => {
+            if let Some(args) = field_descriptor_call_args(expr) {
+                args.len() == 1 && matches!(&args[0], Arg::Positional(Expr::Ellipsis { .. }))
+            } else {
+                false
+            }
         }
-        _ => false,
     }
 }
 
@@ -402,7 +474,7 @@ fn emit_instance_private_methods_metadata(
         .iter()
         .map(|(k, v)| (k.clone(), Value::String(v.clone())))
         .collect();
-    let defining_class_value = Value::Object(Rc::new(RefCell::new(defining_class_map)));
+    let defining_class_value = Value::legacy_object(defining_class_map);
     let defining_class_const = ctx.chunk.add_constant(defining_class_value);
     ctx.chunk
         .write_with_line(OpCode::Constant(defining_class_const), line);
@@ -544,12 +616,12 @@ pub fn compile_class(
         // visibility: None = private, Some(false) = protected, Some(true) = public
         let private_method_names: Vec<String> = methods
             .iter()
-            .filter(|m| m.visibility.is_none())
+            .filter(|m| m.visibility.is_none() && !m.is_special_method())
             .map(|m| m.name.clone())
             .collect();
         let protected_method_names: Vec<String> = methods
             .iter()
-            .filter(|m| m.visibility == Some(false))
+            .filter(|m| m.visibility == Some(false) && !m.is_special_method())
             .map(|m| m.name.clone())
             .collect();
         let public_field_names: Vec<String> =
@@ -648,6 +720,7 @@ pub fn compile_class(
         let method_names_value = Value::Array(Rc::new(RefCell::new(
             methods
                 .iter()
+                .filter(|m| !m.is_special_method())
                 .map(|m| Value::String(m.name.clone()))
                 .collect(),
         )));
@@ -692,10 +765,10 @@ pub fn compile_class(
                             .collect();
                         obj.insert(
                             "private_field_defining_class".to_string(),
-                            Value::Object(Rc::new(RefCell::new(defining))),
+                            Value::legacy_object(defining),
                         );
                     }
-                    Some(Value::Object(Rc::new(RefCell::new(obj))))
+                    Some(Value::legacy_object(obj))
                 })
                 .collect();
             let val = Value::Array(Rc::new(RefCell::new(nested_specs_for_class)));
@@ -708,7 +781,61 @@ pub fn compile_class(
         // ВАЖНО: Сначала объявляем все методы (forward declaration), чтобы их индексы были известны
         // при компиляции конструкторов (конструкторы должны добавлять методы в объект)
         let mut method_indices = std::collections::HashMap::new();
-        for method in methods.iter() {
+        let mut special_method_indices = std::collections::HashMap::new();
+
+        let mut seen_special = std::collections::HashSet::new();
+        for method in methods.iter().filter(|m| m.is_special_method()) {
+            if !seen_special.insert(method.name.clone()) {
+                return Err(LangError::ParseError {
+                    message: format!(
+                        "Duplicate special method `{}` in class `{}`",
+                        method.name, name
+                    ),
+                    line: method.line,
+                    file: ctx.source_name.map(|s| s.to_string()),
+                });
+            }
+            validate_special_method_signature(method, name)?;
+        }
+        for method in methods.iter().filter(|m| m.is_special_method()) {
+            let suffix = &method.name[1..];
+            let method_name = format!("{}::special_{}", name, suffix);
+
+            let user_params: Vec<_> = method
+                .params
+                .iter()
+                .filter(|p| p.name != "@class")
+                .collect();
+            let arity = 1 + user_params.len();
+
+            let mut method_function = Function::new(method_name.clone(), arity);
+            let mut param_names = vec!["this".to_string()];
+            let mut param_types = vec![None];
+            for param in &user_params {
+                param_names.push(param.name.clone());
+                param_types.push(param.type_annotation.clone());
+            }
+            method_function.param_names = param_names;
+            method_function.param_types = param_types;
+            method_function.return_type = method.return_type.clone();
+            method_function.default_values = method_default_values(
+                &user_params,
+                false,
+                ctx.compile_time_bindings,
+                ctx.source_name,
+            )?;
+
+            let function_index = ctx.functions.len();
+            ctx.functions.push(method_function.clone());
+            ctx.function_names.push(method_name.clone());
+            special_method_indices.insert(method.name.clone(), function_index);
+            let global_index = ctx.scope.globals.len();
+            ctx.scope.globals.insert(method_name.clone(), global_index);
+        }
+
+        let init_function_index = special_method_indices.get("@init").copied();
+
+        for method in methods.iter().filter(|m| !m.is_special_method()) {
             let method_name = format!("{}::method_{}", name, method.name);
 
             // Check if method has @class as first parameter (injected by VM at call time)
@@ -741,6 +868,12 @@ pub fn compile_class(
             method_function.param_names = param_names;
             method_function.param_types = param_types;
             method_function.return_type = method.return_type.clone();
+            method_function.default_values = method_default_values(
+                &user_params,
+                has_at_class,
+                ctx.compile_time_bindings,
+                ctx.source_name,
+            )?;
 
             // Сохраняем функцию (forward declaration)
             let function_index = ctx.functions.len();
@@ -768,6 +901,31 @@ pub fn compile_class(
                 constructors.iter().collect()
             };
 
+        for constructor in &constructors_to_compile {
+            if let Some(init) = methods.iter().find(|m| m.name == "@init") {
+                validate_init_matches_constructor(init, &constructor.params, constructor.line)?;
+            }
+        }
+        if constructors_to_compile.is_empty() {
+            if let Some(init) = methods.iter().find(|m| m.name == "@init") {
+                if !init
+                    .params
+                    .iter()
+                    .filter(|p| p.name != "@class")
+                    .collect::<Vec<_>>()
+                    .is_empty()
+                {
+                    return Err(LangError::ParseError {
+                        message:
+                            "`@init` parameter count must match constructor parameter count (0)"
+                                .to_string(),
+                        line: init.line,
+                        file: ctx.source_name.map(|s| s.to_string()),
+                    });
+                }
+            }
+        }
+
         if superclass.is_some() && constructors.is_empty() {
             // For extends_table: generate implicit constructor that takes one param per instance field (ORM-style).
             // Use all instance fields (private + protected + public) so classes without "public:" still get the constructor.
@@ -781,6 +939,7 @@ pub fn compile_class(
                     .iter()
                     .map(|f| Param {
                         name: f.name.clone(),
+                        kind: crate::parser::ast::ParamKind::Regular,
                         type_annotation: f.type_annotation.clone(),
                         default_value: f.default_value.clone(),
                     })
@@ -862,13 +1021,17 @@ pub fn compile_class(
 
                 let saved_chunk =
                     std::mem::replace(&mut *ctx.chunk, constructor_function.chunk.clone());
+                let label_ckpt_extends_table = nested_chunk::checkpoint_labels(&ctx.labels);
+                nested_chunk::enter_nested_label_scope(&mut ctx.labels);
                 ctx.chunk.set_source_name(ctx.source_name);
                 ctx.chunk.set_source_name(ctx.source_name);
                 let saved_function = ctx.current_function;
                 let saved_local_count = ctx.scope.local_count;
+                let saved_method_object_temps = ctx.scope.snapshot_method_object_temps();
 
                 ctx.current_function = Some(function_index);
                 ctx.scope.local_count = 0;
+                ctx.scope.reset_method_object_temps();
                 ctx.scope.begin_scope();
 
                 for param in &params {
@@ -933,7 +1096,7 @@ pub fn compile_class(
 
                 emit_instance_class_reference(ctx, *line, this_slot, class_global_index);
 
-                for (_, method) in methods.iter().enumerate() {
+                for (_, method) in methods.iter().filter(|m| !m.is_special_method()).enumerate() {
                     if let Some(&method_function_index) = method_indices.get(&method.name) {
                         let method_function_const = ctx
                             .chunk
@@ -952,15 +1115,21 @@ pub fn compile_class(
                     }
                 }
 
-                ctx.chunk
-                    .write_with_line(OpCode::LoadLocal(this_slot), *line);
-                ctx.chunk.write_with_line(OpCode::Return, *line);
+                emit_constructor_return(ctx, *line, this_slot, n, init_function_index);
+
+                nested_chunk::finalize_nested_chunk(
+                    &mut ctx.labels,
+                    label_ckpt_extends_table,
+                    ctx.chunk,
+                    *line,
+                )?;
 
                 ctx.functions[function_index].chunk =
                     std::mem::replace(&mut *ctx.chunk, saved_chunk);
                 ctx.scope.end_scope();
                 ctx.current_function = saved_function;
                 ctx.scope.local_count = saved_local_count;
+                ctx.scope.restore_method_object_temps(saved_method_object_temps);
 
                 ctx.chunk
                     .global_names
@@ -1076,6 +1245,8 @@ pub fn compile_class(
                         .insert(global_index, constructor_name.clone());
                     let saved_chunk =
                         std::mem::replace(&mut *ctx.chunk, constructor_function.chunk.clone());
+                    let label_ckpt_settings_ctor = nested_chunk::checkpoint_labels(&ctx.labels);
+                    nested_chunk::enter_nested_label_scope(&mut ctx.labels);
                     ctx.chunk.set_source_name(ctx.source_name);
                     let saved_function = ctx.current_function;
                     let saved_local_count = ctx.scope.local_count;
@@ -1094,56 +1265,9 @@ pub fn compile_class(
                     ctx.chunk
                         .global_names
                         .insert(supercall_global_index, super_callable_name.clone());
-                    // Build nested_specs for load_env 4th arg (field, env_prefix, class_name) so nested Settings get proper env key grouping.
-                    // Store in context so subclasses (e.g. DevSettings) can pass parent's nested_specs when calling super.
-                    let nested_specs_const_index = if is_settings_chain {
-                        let nested_specs: Vec<Value> = all_fields_iter()
-                            .filter_map(|f| {
-                                let factory_name = extract_default_factory_name(&f.default_value)?;
-                                let env_prefix = ctx
-                                    .class_settings_env_prefix
-                                    .get(&factory_name)
-                                    .cloned()
-                                    .unwrap_or_default();
-                                let mut obj = std::collections::HashMap::new();
-                                obj.insert("field".to_string(), Value::String(f.name.clone()));
-                                obj.insert("env_prefix".to_string(), Value::String(env_prefix));
-                                obj.insert(
-                                    "class_name".to_string(),
-                                    Value::String(factory_name.clone()),
-                                );
-                                if let Some(private_names) =
-                                    ctx.class_private_fields.get(&factory_name)
-                                {
-                                    obj.insert(
-                                        "private_fields".to_string(),
-                                        Value::Array(Rc::new(RefCell::new(
-                                            private_names
-                                                .iter()
-                                                .map(|s| Value::String(s.clone()))
-                                                .collect(),
-                                        ))),
-                                    );
-                                    let defining: HashMap<String, Value> = private_names
-                                        .iter()
-                                        .map(|s| (s.clone(), Value::String(factory_name.clone())))
-                                        .collect();
-                                    obj.insert(
-                                        "private_field_defining_class".to_string(),
-                                        Value::Object(Rc::new(RefCell::new(defining))),
-                                    );
-                                }
-                                Some(Value::Object(Rc::new(RefCell::new(obj))))
-                            })
-                            .collect();
-                        let nested_specs_value = Value::Array(Rc::new(RefCell::new(nested_specs)));
-                        ctx.class_nested_specs_value
-                            .insert(name.clone(), nested_specs_value.clone());
-                        Some(ctx.chunk.add_constant(nested_specs_value))
-                    } else {
-                        None
-                    };
-                    // When superclass is Settings: pass (path, required_keys, model_config, nested_specs). If model_config (arg 2) is Null, load from __constructing_class__ (e.g. when called from default_factory).
+                    // Nested specs for load_env are read at runtime from this class object's "__nested_specs"
+                    // (populated during class init) so bytecode always matches the live class metadata.
+                    // When superclass is Settings: super call is always load_env(path, required_keys, model_config, nested_specs, parent_field_name). If model_config (arg 2) is Null, load from __constructing_class__ (e.g. default_factory).
                     if superclass_name == "Settings" {
                         ctx.chunk.write_with_line(OpCode::LoadLocal(0), *line);
                         ctx.chunk.write_with_line(OpCode::LoadLocal(1), *line);
@@ -1175,24 +1299,31 @@ pub fn compile_class(
                         ctx.labels.mark_label(use_arg_label, ctx.chunk.code.len());
                         ctx.chunk.write_with_line(OpCode::LoadLocal(2), *line);
                         ctx.labels.mark_label(after_label, ctx.chunk.code.len());
-                        if let Some(idx) = nested_specs_const_index {
-                            ctx.chunk.write_with_line(OpCode::Constant(idx), *line);
-                        }
+                        // Settings.__call__/load_env: (path, rk, mc, nested_specs, parent_field_name).
+                        let nested_specs_key_const = ctx
+                            .chunk
+                            .add_constant(Value::String("__nested_specs".to_string()));
+                        ctx.chunk
+                            .write_with_line(OpCode::LoadGlobal(class_global_index), *line);
+                        ctx.chunk
+                            .write_with_line(OpCode::Constant(nested_specs_key_const), *line);
+                        ctx.chunk.write_with_line(OpCode::GetArrayElement, *line);
                         ctx.chunk.write_with_line(OpCode::LoadLocal(3), *line);
                         ctx.chunk
                             .write_with_line(OpCode::LoadGlobal(supercall_global_index), *line);
-                        ctx.chunk.write_with_line(
-                            OpCode::Call(if nested_specs_const_index.is_some() {
-                                5
-                            } else {
-                                4
-                            }),
-                            *line,
-                        );
+                        ctx.chunk.write_with_line(OpCode::Call(5), *line);
                     } else if is_settings_chain {
                         // Same third-arg logic as super(Settings): use LoadLocal(2) when non-Null, else __constructing_class__["model_config"] (so module call-site expansion and single-file default_factory both work).
                         ctx.chunk.write_with_line(OpCode::LoadLocal(0), *line);
-                        ctx.chunk.write_with_line(OpCode::LoadLocal(1), *line);
+                        // Parent ctor validates env against the *superclass's* required keys (not the subclass's).
+                        let parent_required_keys_val = ctx
+                            .class_required_keys_value
+                            .get(superclass_name)
+                            .cloned()
+                            .unwrap_or_else(|| Value::Array(Rc::new(RefCell::new(Vec::new()))));
+                        let parent_rk_const = ctx.chunk.add_constant(parent_required_keys_val);
+                        ctx.chunk
+                            .write_with_line(OpCode::Constant(parent_rk_const), *line);
                         ctx.chunk.write_with_line(OpCode::LoadLocal(2), *line);
                         let null_const_sc = ctx.chunk.add_constant(Value::Null);
                         ctx.chunk
@@ -1222,20 +1353,10 @@ pub fn compile_class(
                             .mark_label(use_arg_label_sc, ctx.chunk.code.len());
                         ctx.chunk.write_with_line(OpCode::LoadLocal(2), *line);
                         ctx.labels.mark_label(after_label_sc, ctx.chunk.code.len());
-                        let has_nested_specs =
-                            superclass_name == "Settings" && nested_specs_const_index.is_some();
-                        if has_nested_specs {
-                            if let Some(idx) = nested_specs_const_index {
-                                ctx.chunk.write_with_line(OpCode::Constant(idx), *line);
-                            }
-                        }
                         ctx.chunk.write_with_line(OpCode::LoadLocal(3), *line);
                         ctx.chunk
                             .write_with_line(OpCode::LoadGlobal(supercall_global_index), *line);
-                        ctx.chunk.write_with_line(
-                            OpCode::Call(if has_nested_specs { 5 } else { 4 }),
-                            *line,
-                        );
+                        ctx.chunk.write_with_line(OpCode::Call(4), *line);
                     } else {
                         // VM Call pops callee first (top), then args: stack must be [arg, callee]
                         ctx.chunk.write_with_line(OpCode::LoadLocal(0), *line);
@@ -1291,8 +1412,13 @@ pub fn compile_class(
                     }
                     emit_instance_class_reference(ctx, *line, this_slot, class_global_index);
                     // For Settings subclasses: fill missing fields that have default_factory (e.g. db: DatabaseConfig = Field(default_factory=DatabaseConfig))
+                    // Must match nested_specs/all_fields_iter: fields without `public:` live in private_fields; they still need default_factory emission.
                     if is_settings_chain {
-                        for f in public_fields.iter() {
+                        for f in private_fields
+                            .iter()
+                            .chain(protected_fields.iter())
+                            .chain(public_fields.iter())
+                        {
                             if let Some(factory_name) =
                                 extract_default_factory_name(&f.default_value)
                             {
@@ -1313,40 +1439,56 @@ pub fn compile_class(
                                 ctx.chunk
                                     .write_with_line(OpCode::Constant(field_name_const), *line);
                                 ctx.chunk.write_with_line(OpCode::GetArrayElement, *line);
-                                ctx.chunk.write_with_line(OpCode::Clone, *line);
                                 let null_const = ctx.chunk.add_constant(Value::Null);
                                 ctx.chunk
                                     .write_with_line(OpCode::Constant(null_const), *line);
                                 ctx.chunk.write_with_line(OpCode::Equal, *line);
                                 ctx.labels.emit_jump(ctx.chunk, *line, true, skip_label)?;
-                                ctx.chunk.write_with_line(OpCode::Pop, *line);
                                 ctx.chunk.write_with_line(OpCode::LoadLocal(0), *line);
-                                // Nested Settings subclass: pass (path, required_keys, Null); constructor uses __constructing_class__ when model_config is Null.
+                                // Nested Settings ctor: pass nested class model_config from its class object so load_env uses the correct env_prefix (e.g. DB__), not outer __constructing_class__ (APP__).
                                 let factory_required_keys =
                                     ctx.class_required_keys_value.get(&factory_name).cloned();
                                 let factory_ctor_name = format!("{}::new_1", factory_name);
                                 let factory_ctor_global =
                                     ctx.scope.globals.get(&factory_ctor_name).copied();
-                                if let (Some(required_keys_value), Some(_ctor_global_index)) =
+                                if let (Some(required_keys_value), Some(_real_ctor_global)) =
                                     (factory_required_keys, factory_ctor_global)
                                 {
-                                    // Always use a dedicated slot for the nested constructor so set_functions can patch LoadGlobal by name. The scope index can collide with the current class's constructor (same index) and the later insert(class_global_index, name) would overwrite the factory ctor name in chunk.global_names, causing LoadGlobal to load the wrong constructor.
-                                    let ctor_slot = {
-                                        let fresh = ctx.scope.globals.len();
-                                        ctx.scope.globals.insert(factory_ctor_name.clone(), fresh);
-                                        fresh
-                                    };
-                                    let req_const = ctx.chunk.add_constant(required_keys_value);
-                                    ctx.chunk
-                                        .write_with_line(OpCode::Constant(req_const), *line);
-                                    let null_const = ctx.chunk.add_constant(Value::Null);
-                                    ctx.chunk
-                                        .write_with_line(OpCode::Constant(null_const), *line);
-                                    ctx.chunk
-                                        .write_with_line(OpCode::Constant(field_name_const), *line);
+                                    // Dedicated slot for this LoadGlobal so chunk.global_names does not collide
+                                    // with the enclosing class constructor's index. Do not re-key
+                                    // `factory_ctor_name` in scope.globals — that orphaned the real ctor slot.
+                                    let ctor_slot = ctx
+                                        .scope
+                                        .globals
+                                        .values()
+                                        .copied()
+                                        .max()
+                                        .unwrap_or(0)
+                                        .saturating_add(1);
+                                    ctx.scope.globals.insert(
+                                        format!(
+                                            "__settings_default_factory__{}__{}",
+                                            factory_ctor_name.replace("::", "_"),
+                                            ctor_slot
+                                        ),
+                                        ctor_slot,
+                                    );
                                     ctx.chunk
                                         .global_names
                                         .insert(ctor_slot, factory_ctor_name.clone());
+                                    let req_const = ctx.chunk.add_constant(required_keys_value);
+                                    ctx.chunk
+                                        .write_with_line(OpCode::Constant(req_const), *line);
+                                    let mc_key_const = ctx
+                                        .chunk
+                                        .add_constant(Value::String("model_config".to_string()));
+                                    ctx.chunk
+                                        .write_with_line(OpCode::LoadGlobal(factory_global_index), *line);
+                                    ctx.chunk
+                                        .write_with_line(OpCode::Constant(mc_key_const), *line);
+                                    ctx.chunk.write_with_line(OpCode::GetArrayElement, *line);
+                                    ctx.chunk
+                                        .write_with_line(OpCode::Constant(field_name_const), *line);
                                     ctx.chunk
                                         .write_with_line(OpCode::LoadGlobal(ctor_slot), *line);
                                     ctx.chunk.write_with_line(OpCode::Call(4), *line);
@@ -1362,6 +1504,10 @@ pub fn compile_class(
                                 ctx.chunk
                                     .write_with_line(OpCode::LoadLocal(this_slot), *line);
                                 ctx.chunk.write_with_line(OpCode::SetArrayElement, *line);
+                                // SetArrayElement leaves the container on the stack; StoreLocal matches
+                                // Field(default=...) init below so nested default_factory loops cannot corrupt stack depth.
+                                ctx.chunk
+                                    .write_with_line(OpCode::StoreLocal(this_slot), *line);
                                 ctx.labels.mark_label(skip_label, ctx.chunk.code.len());
                             }
                         }
@@ -1414,7 +1560,7 @@ pub fn compile_class(
                     ctx.chunk
                         .global_names
                         .insert(class_global_index, name.clone());
-                    for (_, method) in methods.iter().enumerate() {
+                    for (_, method) in methods.iter().filter(|m| !m.is_special_method()).enumerate() {
                         if let Some(&method_function_index) = method_indices.get(&method.name) {
                             let method_function_const = ctx
                                 .chunk
@@ -1432,12 +1578,19 @@ pub fn compile_class(
                                 .write_with_line(OpCode::StoreLocal(this_slot), *line);
                         }
                     }
-                    ctx.chunk
-                        .write_with_line(OpCode::LoadLocal(this_slot), *line);
-                    ctx.chunk.write_with_line(OpCode::Return, *line);
-                    if !ctx.labels.pending_jumps.is_empty() {
-                        ctx.labels.finalize_jumps_from(ctx.chunk, 0, *line)?;
-                    }
+                    emit_constructor_return(
+                        ctx,
+                        *line,
+                        this_slot,
+                        param_count,
+                        init_function_index,
+                    );
+                    nested_chunk::finalize_nested_chunk(
+                        &mut ctx.labels,
+                        label_ckpt_settings_ctor,
+                        ctx.chunk,
+                        *line,
+                    )?;
                     // Final guarantee: class name in chunk.global_names so update_chunk_indices_from_names patches LoadGlobal(class_global_index) correctly.
                     ctx.chunk
                         .global_names
@@ -1474,6 +1627,8 @@ pub fn compile_class(
                     ctx.function_names.push(constructor_name_0.clone());
                     let saved_chunk_0 =
                         std::mem::replace(&mut *ctx.chunk, constructor_function_0.chunk.clone());
+                    let label_ckpt_new_0_implicit = nested_chunk::checkpoint_labels(&ctx.labels);
+                    nested_chunk::enter_nested_label_scope(&mut ctx.labels);
                     ctx.chunk.set_source_name(ctx.source_name);
                     let saved_function_0 = ctx.current_function;
                     ctx.current_function = Some(function_index_0);
@@ -1576,9 +1731,13 @@ pub fn compile_class(
                         .global_names
                         .insert(class_global_index, name.clone());
                     emit_instance_class_reference(ctx, *line, this_slot_0, class_global_index);
-                    ctx.chunk
-                        .write_with_line(OpCode::LoadLocal(this_slot_0), *line);
-                    ctx.chunk.write_with_line(OpCode::Return, *line);
+                    emit_constructor_return(ctx, *line, this_slot_0, 0, init_function_index);
+                    nested_chunk::finalize_nested_chunk(
+                        &mut ctx.labels,
+                        label_ckpt_new_0_implicit,
+                        ctx.chunk,
+                        *line,
+                    )?;
                     ctx.functions[function_index_0].chunk =
                         std::mem::replace(&mut *ctx.chunk, saved_chunk_0);
                     ctx.scope.end_scope();
@@ -1617,12 +1776,16 @@ pub fn compile_class(
 
             let saved_chunk =
                 std::mem::replace(&mut *ctx.chunk, constructor_function.chunk.clone());
+            let label_ckpt_implicit_new_0 = nested_chunk::checkpoint_labels(&ctx.labels);
+            nested_chunk::enter_nested_label_scope(&mut ctx.labels);
             ctx.chunk.set_source_name(ctx.source_name);
             let saved_function = ctx.current_function;
             let saved_local_count = ctx.scope.local_count;
+            let saved_method_object_temps = ctx.scope.snapshot_method_object_temps();
 
             ctx.current_function = Some(function_index);
             ctx.scope.local_count = 0;
+            ctx.scope.reset_method_object_temps();
             ctx.scope.begin_scope();
 
             let this_slot = ctx.scope.declare_local("this");
@@ -1675,7 +1838,7 @@ pub fn compile_class(
             }
 
             // Привязать методы к экземпляру
-            for (_, method) in methods.iter().enumerate() {
+            for (_, method) in methods.iter().filter(|m| !m.is_special_method()).enumerate() {
                 if let Some(&method_function_index) = method_indices.get(&method.name) {
                     let method_function_const = ctx
                         .chunk
@@ -1694,14 +1857,20 @@ pub fn compile_class(
                 }
             }
 
-            ctx.chunk
-                .write_with_line(OpCode::LoadLocal(this_slot), *line);
-            ctx.chunk.write_with_line(OpCode::Return, *line);
+            emit_constructor_return(ctx, *line, this_slot, 0, init_function_index);
+
+            nested_chunk::finalize_nested_chunk(
+                &mut ctx.labels,
+                label_ckpt_implicit_new_0,
+                ctx.chunk,
+                *line,
+            )?;
 
             ctx.functions[function_index].chunk = std::mem::replace(&mut *ctx.chunk, saved_chunk);
             ctx.scope.end_scope();
             ctx.current_function = saved_function;
             ctx.scope.local_count = saved_local_count;
+            ctx.scope.restore_method_object_temps(saved_method_object_temps);
 
             ctx.chunk
                 .global_names
@@ -1736,6 +1905,25 @@ pub fn compile_class(
                 .map(|p| p.type_annotation.clone())
                 .collect();
 
+            let signature_param_names: Vec<String> =
+                constructor.params.iter().map(|p| p.name.clone()).collect();
+            let mut default_values = Vec::with_capacity(constructor.params.len());
+            for param in &constructor.params {
+                if let Some(ref default_expr) = param.default_value {
+                    let constant_value = crate::compiler::defaults::resolve_default_param_value(
+                        default_expr,
+                        &param.name,
+                        &signature_param_names,
+                        ctx.compile_time_bindings,
+                        ctx.source_name,
+                    )?;
+                    default_values.push(Some(constant_value));
+                } else {
+                    default_values.push(None);
+                }
+            }
+            constructor_function.default_values = default_values;
+
             // Сохраняем функцию
             let function_index = ctx.functions.len();
             ctx.functions.push(constructor_function.clone());
@@ -1754,12 +1942,16 @@ pub fn compile_class(
             // Компилируем тело конструктора
             let saved_chunk =
                 std::mem::replace(&mut *ctx.chunk, constructor_function.chunk.clone());
+            let label_ckpt_explicit_ctor = nested_chunk::checkpoint_labels(&ctx.labels);
+            nested_chunk::enter_nested_label_scope(&mut ctx.labels);
             ctx.chunk.set_source_name(ctx.source_name);
             let saved_function = ctx.current_function;
             let saved_local_count = ctx.scope.local_count;
+            let saved_method_object_temps = ctx.scope.snapshot_method_object_temps();
 
             ctx.current_function = Some(function_index);
             ctx.scope.local_count = 0;
+            ctx.scope.reset_method_object_temps();
             ctx.scope.begin_scope();
 
             // Параметры конструктора будут в локальных слотах, начиная с 0
@@ -1784,6 +1976,7 @@ pub fn compile_class(
             // Track how many statements to skip when compiling body
             // (1 when explicit super() in body was already compiled)
             let mut body_skip_count: usize = 0;
+            let mut same_class_delegated = false;
 
             if let Some(ref super_name) = superclass {
                 if let Some(ref delegate_args) = constructor.delegate_args {
@@ -1974,7 +2167,7 @@ pub fn compile_class(
                         match arg {
                             Arg::Positional(arg_expr) => expr::compile_expr(ctx, arg_expr)?,
                             Arg::Named { value, .. } => expr::compile_expr(ctx, value)?,
-                            Arg::UnpackObject(expr) => expr::compile_expr(ctx, expr)?,
+                            Arg::UnpackObject(expr) | Arg::UnpackArray(expr) => expr::compile_expr(ctx, expr)?,
                         }
                     }
                     ctx.chunk
@@ -2063,6 +2256,17 @@ pub fn compile_class(
                     );
                     emit_instance_class_reference(ctx, *line, this_slot, class_global_index);
                 }
+            } else if let Some(ref delegate_args) = constructor.delegate_args {
+                same_class_delegated = true;
+                call::emit_same_class_delegate(
+                    ctx,
+                    name,
+                    &constructor_name,
+                    class_global_index,
+                    delegate_args,
+                    this_slot,
+                    *line,
+                )?;
             } else {
                 // Создаем пустой объект-экземпляр
                 ctx.chunk.write_with_line(OpCode::MakeObject(0), *line);
@@ -2102,6 +2306,7 @@ pub fn compile_class(
                 emit_instance_class_reference(ctx, *line, this_slot, class_global_index);
             }
 
+            if !same_class_delegated {
             // Инициализируем поля значениями по умолчанию
             // Сначала private поля
             for field in private_fields.iter() {
@@ -2241,6 +2446,7 @@ pub fn compile_class(
                     }
                 }
             }
+            } // !same_class_delegated
 
             // Set context for class compilation (used by super.method() resolution)
             ctx.current_class = Some(name.clone());
@@ -2265,6 +2471,26 @@ pub fn compile_class(
             // Use arity explicitly so "this" is always at slot [param_count] (params at 0..arity-1, this at arity).
             ctx.constructor_this_slot = Some(constructor.params.len());
 
+            // Bind methods on `this` before the constructor body so `this.method(...)` works during init.
+            for method in methods.iter().filter(|m| !m.is_special_method()) {
+                if let Some(&method_function_index) = method_indices.get(&method.name) {
+                    let method_function_const = ctx
+                        .chunk
+                        .add_constant(Value::Function(method_function_index));
+                    ctx.chunk
+                        .write_with_line(OpCode::Constant(method_function_const), *line);
+                    let method_name_const =
+                        ctx.chunk.add_constant(Value::String(method.name.clone()));
+                    ctx.chunk
+                        .write_with_line(OpCode::Constant(method_name_const), *line);
+                    ctx.chunk
+                        .write_with_line(OpCode::LoadLocal(this_slot), *line);
+                    ctx.chunk.write_with_line(OpCode::SetArrayElement, *line);
+                    ctx.chunk
+                        .write_with_line(OpCode::StoreLocal(this_slot), *line);
+                }
+            }
+
             // Компилируем тело конструктора (this доступен как локальная переменная)
             // Skip first statement(s) if they were already compiled (e.g., explicit super())
             for stmt in constructor.body.iter().skip(body_skip_count) {
@@ -2275,40 +2501,19 @@ pub fn compile_class(
             ctx.in_constructor = false;
             ctx.constructor_this_slot = None;
 
-            // ВАЖНО: Добавляем методы класса в объект перед возвратом
-            // Методы должны быть доступны через GetArrayElement при вызове методов
+            // Methods were bound before the body; keep debug parity with legacy ordering.
             debug_println!(
-                "[DEBUG compile_class] Добавляем {} методов в объект конструктора '{}'",
+                "[DEBUG compile_class] Методы ({}) уже привязаны к this в конструкторе '{}'",
                 methods.len(),
                 constructor_name
             );
-            for (idx, method) in methods.iter().enumerate() {
-                // Используем сохраненный индекс метода из forward declaration
-                if let Some(&method_function_index) = method_indices.get(&method.name) {
-                    debug_println!("[DEBUG compile_class] Сохраняем метод #{}: '{}' в объект с индексом функции {} (полное имя: '{}::method_{}')", 
-                        idx, method.name, method_function_index, name, method.name);
-
-                    // ВАЖНО: SetArrayElement ожидает порядок на стеке: [value, index/key, container]
-                    // То есть: [function, method_name, object]
-                    // Загружаем функцию метода (value)
-                    let method_function_const = ctx
-                        .chunk
-                        .add_constant(Value::Function(method_function_index));
-                    ctx.chunk
-                        .write_with_line(OpCode::Constant(method_function_const), *line);
-                    // Загружаем имя метода как строку (key)
-                    let method_name_const =
-                        ctx.chunk.add_constant(Value::String(method.name.clone()));
-                    ctx.chunk
-                        .write_with_line(OpCode::Constant(method_name_const), *line);
-                    // Загружаем this (container)
-                    ctx.chunk
-                        .write_with_line(OpCode::LoadLocal(this_slot), *line);
-                    // Устанавливаем метод в объект: SetArrayElement ожидает [function, method_name, object]
-                    ctx.chunk.write_with_line(OpCode::SetArrayElement, *line);
-                    // SetArrayElement возвращает обновленный объект, сохраняем его обратно в this
-                    ctx.chunk
-                        .write_with_line(OpCode::StoreLocal(this_slot), *line);
+            for (idx, method) in methods.iter().filter(|m| !m.is_special_method()).enumerate() {
+                if method_indices.get(&method.name).is_some() {
+                    debug_println!(
+                        "[DEBUG compile_class] Метод #{}: '{}' на this",
+                        idx,
+                        method.name
+                    );
                 } else {
                     debug_println!(
                         "[ERROR compile_class] Метод '{}' не найден в method_indices!",
@@ -2318,9 +2523,20 @@ pub fn compile_class(
             }
 
             // В конце конструктора возвращаем this
-            ctx.chunk
-                .write_with_line(OpCode::LoadLocal(this_slot), *line);
-            ctx.chunk.write_with_line(OpCode::Return, *line);
+            emit_constructor_return(
+                ctx,
+                *line,
+                this_slot,
+                constructor.params.len(),
+                init_function_index,
+            );
+
+            nested_chunk::finalize_nested_chunk(
+                &mut ctx.labels,
+                label_ckpt_explicit_ctor,
+                ctx.chunk,
+                *line,
+            )?;
 
             // Логируем сгенерированный байткод конструктора
             let compiled_chunk = &ctx.chunk;
@@ -2359,6 +2575,7 @@ pub fn compile_class(
             ctx.scope.end_scope();
             ctx.current_function = saved_function;
             ctx.scope.local_count = saved_local_count;
+            ctx.scope.restore_method_object_temps(saved_method_object_temps);
 
             // Сохраняем конструктор в глобальную переменную (аналогично обычным функциям)
             let constructor_global_index = *ctx.scope.globals.get(&constructor_name).unwrap();
@@ -2374,15 +2591,20 @@ pub fn compile_class(
         }
 
         // Компилируем тела методов (функции уже объявлены в первом проходе, используем их индексы)
-        for method in methods.iter() {
-            let function_index =
-                *method_indices
+        let all_method_entries: Vec<(&Method, usize)> = methods
+            .iter()
+            .filter_map(|method| {
+                method_indices
                     .get(&method.name)
-                    .ok_or_else(|| LangError::ParseError {
-                        message: format!("Method '{}' not found in method_indices", method.name),
-                        line: *line,
-                        file: None,
-                    })?;
+                    .map(|&idx| (method, idx))
+                    .or_else(|| {
+                        special_method_indices
+                            .get(&method.name)
+                            .map(|&idx| (method, idx))
+                    })
+            })
+            .collect();
+        for (method, function_index) in all_method_entries {
             let method_function = &ctx.functions[function_index];
             let has_at_class = method
                 .params
@@ -2397,12 +2619,19 @@ pub fn compile_class(
 
             // Компилируем тело метода в chunk этой функции (уже объявленной)
             let saved_chunk = std::mem::replace(&mut *ctx.chunk, method_function.chunk.clone());
+            let label_ckpt_method = nested_chunk::checkpoint_labels(&ctx.labels);
+            nested_chunk::enter_nested_label_scope(&mut ctx.labels);
             let saved_function = ctx.current_function;
             let saved_local_count = ctx.scope.local_count;
+            let saved_method_object_temps = ctx.scope.snapshot_method_object_temps();
 
             ctx.current_function = Some(function_index);
             ctx.scope.local_count = 0;
+            ctx.scope.reset_method_object_temps();
             ctx.scope.begin_scope();
+
+            // Method bodies belong to separate functions; ctor-only state must never leak here.
+            ctx.constructor_this_slot = None;
 
             // First parameter - this; second - @class if method has it (injected by VM at call time)
             ctx.scope.declare_local("this");
@@ -2426,12 +2655,34 @@ pub fn compile_class(
             // Если нет return, добавляем return null
             ctx.chunk.write_with_line(OpCode::Return, *line);
 
+            nested_chunk::finalize_nested_chunk(
+                &mut ctx.labels,
+                label_ckpt_method,
+                ctx.chunk,
+                *line,
+            )?;
+
             // Обновляем функцию с скомпилированным телом
             ctx.functions[function_index].chunk = std::mem::replace(&mut *ctx.chunk, saved_chunk);
 
             ctx.scope.end_scope();
             ctx.current_function = saved_function;
             ctx.scope.local_count = saved_local_count;
+            ctx.scope.restore_method_object_temps(saved_method_object_temps);
+
+            if method.is_special_method() {
+                let global_name = ctx.functions[function_index].name.clone();
+                if let Some(&global_index) = ctx.scope.globals.get(&global_name) {
+                    ctx.chunk
+                        .global_names
+                        .insert(global_index, global_name.clone());
+                    let fn_const = ctx.chunk.add_constant(Value::Function(function_index));
+                    ctx.chunk
+                        .write_with_line(OpCode::Constant(fn_const), *line);
+                    ctx.chunk
+                        .write_with_line(OpCode::StoreGlobal(global_index), *line);
+                }
+            }
         }
 
         // Reset class context
@@ -2443,10 +2694,15 @@ pub fn compile_class(
         let ctor_prefix_meta = format!("{}::new_", name);
         for (global_name, _) in ctx.scope.globals.iter() {
             if let Some(suffix) = global_name.strip_prefix(&ctor_prefix_meta) {
-                if suffix.chars().all(|c| c.is_ascii_digit()) {
-                    if let Some(fn_idx) = ctx.function_names.iter().position(|n| n == global_name) {
-                        class_metadata.insert(format!("new_{}", suffix), Value::Function(fn_idx));
-                    }
+                let digit_len = suffix.chars().take_while(|c| c.is_ascii_digit()).count();
+                if digit_len == 0 {
+                    continue;
+                }
+                if let Some(fn_idx) = ctx.function_names.iter().position(|n| n == global_name) {
+                    let arity_key = format!("new_{}", &suffix[..digit_len]);
+                    class_metadata
+                        .entry(arity_key)
+                        .or_insert_with(|| Value::Function(fn_idx));
                 }
             }
         }
@@ -2454,9 +2710,26 @@ pub fn compile_class(
         for (method_name, &fn_idx) in &method_indices {
             class_metadata.insert(method_name.clone(), Value::Function(fn_idx));
         }
+        let mut special_methods_map = HashMap::new();
+        for (key, &fn_idx) in &special_method_indices {
+            special_methods_map.insert(key.clone(), Value::Function(fn_idx));
+        }
+        class_metadata.insert(
+            "__special_methods".to_string(),
+            Value::legacy_object(special_methods_map),
+        );
+        class_metadata.insert(
+            "__special_method_names".to_string(),
+            Value::Array(Rc::new(RefCell::new(
+                special_method_indices
+                    .keys()
+                    .map(|k| Value::String(k.clone()))
+                    .collect(),
+            ))),
+        );
 
         // Сохраняем класс-объект в глобальной области видимости (слот зарезервирован в начале как class_global_index)
-        let class_value = Value::Object(std::rc::Rc::new(std::cell::RefCell::new(class_metadata)));
+        let class_value = Value::legacy_object(class_metadata);
         let class_index = ctx.chunk.add_constant(class_value);
         ctx.chunk
             .write_with_line(OpCode::Constant(class_index), *line);

@@ -4,8 +4,8 @@ use crate::bytecode::{Function, OpCode};
 use crate::common::error::LangError;
 use crate::common::value::Value;
 use crate::compiler::closure;
-use crate::compiler::constant_fold;
 use crate::compiler::context::CompilationContext;
+use crate::compiler::defaults;
 use crate::compiler::expr;
 use crate::parser::ast::Expr;
 
@@ -26,27 +26,20 @@ pub fn compile_lambda(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), L
         let mut param_names = Vec::new();
         let mut param_types = Vec::new();
         let mut default_values = Vec::new();
+        let signature_param_names: Vec<String> = params.iter().map(|p| p.name.clone()).collect();
 
         for param in params.iter() {
             param_names.push(param.name.clone());
             param_types.push(param.type_annotation.clone());
             if let Some(ref default_expr) = param.default_value {
-                match constant_fold::evaluate_constant_expr(default_expr) {
-                    Ok(Some(constant_value)) => {
-                        default_values.push(Some(constant_value));
-                    }
-                    Ok(None) => {
-                        return Err(LangError::ParseError {
-                            message: format!(
-                                "Default value for parameter '{}' must be a constant expression",
-                                param.name
-                            ),
-                            line: default_expr.line(),
-                            file: None,
-                        });
-                    }
-                    Err(e) => return Err(e),
-                }
+                let constant_value = defaults::resolve_default_param_value(
+                    default_expr,
+                    &param.name,
+                    &signature_param_names,
+                    ctx.compile_time_bindings,
+                    ctx.source_name,
+                )?;
+                default_values.push(Some(constant_value));
             } else {
                 default_values.push(None);
             }
@@ -56,6 +49,12 @@ pub fn compile_lambda(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), L
         function.param_types = param_types;
         function.return_type = return_type.clone();
         function.default_values = default_values;
+        function.variadic_pos_index = params
+            .iter()
+            .position(|p| p.kind == crate::parser::ast::ParamKind::VariadicPositional);
+        function.variadic_kw_index = params
+            .iter()
+            .position(|p| p.kind == crate::parser::ast::ParamKind::VariadicKeyword);
         function.arity = params.len();
 
         ctx.functions.push(function.clone());
@@ -66,17 +65,22 @@ pub fn compile_lambda(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), L
         let saved_exception_handlers = ctx.exception_handlers.clone();
         let saved_error_type_table = ctx.error_type_table.clone();
         let saved_function = ctx.current_function;
+        let enclosing_function_index = saved_function.unwrap_or(usize::MAX);
         let saved_local_count = ctx.scope.local_count;
+        let saved_method_object_temps = ctx.scope.snapshot_method_object_temps();
 
         let saved_label_counter = ctx.labels.label_counter;
         let saved_labels = ctx.labels.labels.clone();
         let saved_pending_jumps = ctx.labels.pending_jumps.clone();
+        let saved_pending_for_range = ctx.labels.pending_for_range.clone();
         ctx.labels.label_counter = 0;
         ctx.labels.labels.clear();
         ctx.labels.pending_jumps.clear();
+        ctx.labels.pending_for_range.clear();
 
         ctx.current_function = Some(function_index);
         ctx.scope.local_count = 0;
+        ctx.scope.reset_method_object_temps();
         ctx.exception_handlers.clear();
         ctx.error_type_table.clear();
 
@@ -84,6 +88,13 @@ pub fn compile_lambda(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), L
 
         let parent_locals_snapshot: Vec<std::collections::HashMap<String, usize>> =
             ctx.scope.locals.iter().map(|s| s.clone()).collect();
+
+        let ancestor_bindings = closure::flatten_parent_binding_names(&parent_locals_snapshot);
+        closure::check_illegal_outer_assignments_in_lambda_expr(
+            body.as_ref(),
+            &ancestor_bindings,
+            &param_names,
+        )?;
 
         ctx.scope.begin_scope();
 
@@ -126,11 +137,13 @@ pub fn compile_lambda(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), L
                 parent_slot_index: parent_slot,
                 local_slot_index,
                 ancestor_depth,
+                parent_function_index: enclosing_function_index,
             });
         }
 
         for param in params.iter() {
             ctx.scope.declare_local(&param.name);
+            ctx.record_bound_name(&param.name);
         }
 
         expr::compile_expr(ctx, body.as_ref())?;
@@ -150,10 +163,12 @@ pub fn compile_lambda(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), L
         *ctx.error_type_table = saved_error_type_table;
         ctx.current_function = saved_function;
         ctx.scope.local_count = saved_local_count;
+        ctx.scope.restore_method_object_temps(saved_method_object_temps);
 
         ctx.labels.label_counter = saved_label_counter;
         ctx.labels.labels = saved_labels;
         ctx.labels.pending_jumps = saved_pending_jumps;
+        ctx.labels.pending_for_range = saved_pending_for_range;
 
         let constant_index = ctx.chunk.add_constant(Value::Function(function_index));
         ctx.chunk

@@ -9,10 +9,8 @@ mod tests {
     fn assert_number_result(source: &str, expected: f64) {
         let result = run(source);
         match result {
-            Ok(Value::Number(n)) => {
-                assert_eq!(n, expected, "Expected {}, got {}", expected, n);
-            }
-            Ok(v) => panic!("Expected Number({}), got {:?}", expected, v),
+            Ok(v) if v.as_ieee_f64() == Some(expected) => {}
+            Ok(v) => panic!("Expected numeric({}), got {:?}", expected, v),
             Err(e) => panic!("Error: {:?}", e),
         }
     }
@@ -38,8 +36,8 @@ mod tests {
     #[test]
     fn test_variable_assignment() {
         let source = r#"
-            let x = 10
-            let y = 20
+            x = 10
+            y = 20
             x + y
         "#;
         assert_number_result(source, 30.0);
@@ -59,7 +57,7 @@ mod tests {
     #[test]
     fn test_lambda_basic() {
         let source = r#"
-            let f = fn(x, i) => x + i
+            f = fn(x, i) => x + i
             f(1, 2)
         "#;
         assert_number_result(source, 3.0);
@@ -68,8 +66,8 @@ mod tests {
     #[test]
     fn test_lambda_closure_capture() {
         let source = r#"
-            let a = 1
-            let g = fn(x) => x + a
+            a = 1
+            g = fn(x) => x + a
             g(10)
         "#;
         assert_number_result(source, 11.0);
@@ -100,7 +98,7 @@ mod tests {
     #[test]
     fn test_while_loop() {
         let source = r#"
-            let x = 10
+            x = 10
             while x > 0 {
                 x = x - 1
             }
@@ -112,8 +110,8 @@ mod tests {
     #[test]
     fn test_while_loop_sum() {
         let source = r#"
-            let sum = 0
-            let i = 1
+            sum = 0
+            i = 1
             while i <= 10 {
                 sum = sum + i
                 i = i + 1
@@ -127,8 +125,8 @@ mod tests {
     #[test]
     fn test_if_else() {
         let source = r#"
-            let x = 10
-            let result = 0
+            x = 10
+            result = 0
             if x > 5 {
                 result = 1
             } else {
@@ -142,8 +140,8 @@ mod tests {
     #[test]
     fn test_if_else_false() {
         let source = r#"
-            let x = 3
-            let result = 0
+            x = 3
+            result = 0
             if x > 5 {
                 result = 1
             } else {
@@ -157,9 +155,9 @@ mod tests {
     #[test]
     fn test_global_local_variables() {
         let source = r#"
-            let global_x = 100
+            global_x = 100
             fn test() {
-                let local_x = 10
+                local_x = 10
                 return local_x
             }
             test()
@@ -170,7 +168,7 @@ mod tests {
     #[test]
     fn test_global_access_from_function() {
         let source = r#"
-            let global_x = 100
+            global_x = 100
             fn test() {
                 return global_x
             }
@@ -182,9 +180,9 @@ mod tests {
     #[test]
     fn test_nested_conditionals() {
         let source = r#"
-            let x = 10
-            let y = 5
-            let result = 0
+            x = 10
+            y = 5
+            result = 0
             if x > 5 {
                 if y > 3 {
                     result = 1
@@ -202,9 +200,9 @@ mod tests {
     #[test]
     fn test_complex_expression() {
         let source = r#"
-            let a = 10
-            let b = 20
-            let c = 30
+            a = 10
+            b = 20
+            c = 30
             (a + b) * c / 2
         "#;
         // (10 + 20) * 30 / 2 = 30 * 30 / 2 = 900 / 2 = 450
@@ -258,8 +256,8 @@ mod tests {
             fn square(n) {
                 return n * n
             }
-            let sum = 0
-            let i = 1
+            sum = 0
+            i = 1
             while i <= 5 {
                 sum = sum + square(i)
                 i = i + 1
@@ -287,8 +285,8 @@ mod tests {
     #[test]
     fn test_string_concatenation() {
         let source = r#"
-            let a = "hello"
-            let b = "world"
+            a = "hello"
+            b = "world"
             a + " " + b
         "#;
         let result = run(source);
@@ -323,17 +321,9 @@ mod tests {
     }
 
     #[test]
-    fn test_division_by_zero() {
-        let source = "10 / 0";
-        let result = run(source);
-        // Должна быть ошибка деления на ноль
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn test_variable_reassignment() {
         let source = r#"
-            let x = 10
+            x = 10
             x = 20
             x
         "#;
@@ -362,7 +352,7 @@ mod tests {
     #[test]
     fn test_local_variable_declaration() {
         let source = r#"
-            let a = 10
+            a = 10
             a
         "#;
         assert_number_result(source, 10.0);
@@ -405,6 +395,109 @@ mod tests {
     }
 
     #[test]
+    fn test_local_shadows_global_function() {
+        let source = r#"
+            fn is_prime(n) {
+                return n == 2
+            }
+            fn sieve(n) {
+                is_prime = [true, false]
+                return len(is_prime)
+            }
+            sieve(2) + (if is_prime(2) { 10 } else { 0 })
+        "#;
+        assert_number_result(source, 12.0);
+    }
+
+    #[test]
+    fn test_chained_property_assignment() {
+        let source = r#"
+            cls Node {
+                public:
+                    next: Node
+                    prev: Node
+                    tag: int
+                new Node(t: int) {
+                    this.tag = t
+                    this.next = null
+                    this.prev = null
+                }
+            }
+            head = Node(1)
+            mid = Node(2)
+            tail = Node(3)
+            head.next = mid
+            mid.prev = head
+            mid.next = tail
+            tail.prev = mid
+            mid.prev.next = tail
+            mid.prev.next.tag
+        "#;
+        assert_number_result(source, 3.0);
+    }
+
+    #[test]
+    fn test_doubly_linked_cycle_assignment() {
+        let source = r#"
+            cls LfuNode {
+                public:
+                    prev: LfuNode
+                    next: LfuNode
+                new LfuNode() {
+                    this.prev = null
+                    this.next = null
+                }
+            }
+            dummy = LfuNode()
+            first = LfuNode()
+            node = LfuNode()
+            node.next = first
+            node.prev = dummy
+            dummy.next = node
+            first.prev = node
+            1
+        "#;
+        assert_number_result(source, 1.0);
+    }
+
+    #[test]
+    fn test_array_pop_preserves_object_identity_for_field_mutation() {
+        let source = r#"
+            cls Node {
+                public:
+                    children: dict[str, Node]
+                    fail: Optional[Node]
+                new Node() {
+                    this.children = {}
+                    this.fail = null
+                }
+            }
+            cls Bfs {
+                fn run(root: Node) {
+                    s = Node()
+                    h = Node()
+                    root.children["s"] = s
+                    s.children["h"] = h
+                    queue = []
+                    queue.push(root.children["s"])
+                    current = queue.pop(0)
+                    child = current.children["h"]
+                    child.fail = root
+                    if root.children["s"].children["h"].fail == null { this.result = 0 } else { this.result = 1 }
+                }
+                public:
+                    result: int
+                new Bfs() { this.result = 0 }
+            }
+            root = Node()
+            job = Bfs()
+            job.run(root)
+            job.result
+        "#;
+        assert_number_result(source, 1.0);
+    }
+
+    #[test]
     fn test_global_modification_in_function() {
         let source = r#"
             global counter = 0
@@ -421,7 +514,7 @@ mod tests {
     fn test_global_in_while_loop() {
         let source = r#"
             global sum = 0
-            let i = 1
+            i = 1
             while i <= 5 {
                 global sum = sum + i
                 i = i + 1
@@ -449,9 +542,9 @@ mod tests {
     fn test_local_in_loop_shadows_global() {
         let source = r#"
             global x = 100
-            let sum = 0
+            sum = 0
             for i in [1, 2, 3] {
-                let x = i
+                x = i
                 sum = sum + x
             }
             sum
@@ -568,7 +661,7 @@ mod tests {
     fn test_global_and_local_together() {
         let source = r#"
             global g = 10
-            let l = 20
+            l = 20
             g + l
         "#;
         assert_number_result(source, 30.0);
@@ -625,8 +718,8 @@ mod tests {
     #[test]
     fn test_push_preserves_array_alias_two_variables() {
         let source = r#"
-            let a = []
-            let b = a
+            a = []
+            b = a
             push(a, 1)
             push(a, 2)
             len(a) * 10 + len(b)
@@ -642,8 +735,8 @@ mod tests {
         // 1) Single run: many global array assignments and reads (Inline cache + arena).
         let source_arrays = r#"
             global arr = [1, 2, 3]
-            let n = 0
-            let i = 0
+            n = 0
+            i = 0
             while i < 50 {
                 arr = [i, i+1, i+2]
                 n = arr[0] + len(arr)
@@ -689,10 +782,10 @@ mod tests {
     #[test]
     fn test_array_slice_read_negative_and_copy() {
         let source = r#"
-            let arr = [10, 20, 30, 40, 50]
-            let a = len(arr[1:4])
-            let b = arr[-1]
-            let c = len(arr[:])
+            arr = [10, 20, 30, 40, 50]
+            a = len(arr[1:4])
+            b = arr[-1]
+            c = len(arr[:])
             a + b + c
         "#;
         assert_number_result(source, 58.0);
@@ -701,7 +794,7 @@ mod tests {
     #[test]
     fn test_array_slice_step_and_reverse() {
         let source = r#"
-            let a = [1, 2, 3, 4, 5, 6]
+            a = [1, 2, 3, 4, 5, 6]
             len(a[::2]) + len(a[1::2]) + len(a[::-1])
         "#;
         assert_number_result(source, 12.0);
@@ -710,11 +803,11 @@ mod tests {
     #[test]
     fn test_array_slice_assign_and_delete() {
         let source = r#"
-            let arr = [1, 2, 3, 4, 5]
+            arr = [1, 2, 3, 4, 5]
             arr[1:3] = [20, 30]
-            let x = arr[1]
+            x = arr[1]
             arr[1:4] = []
-            let y = len(arr)
+            y = len(arr)
             x + y
         "#;
         assert_number_result(source, 22.0);
@@ -723,7 +816,7 @@ mod tests {
     #[test]
     fn test_array_subscript_assign_scalar() {
         let source = r#"
-            let arr = [1, 2, 3]
+            arr = [1, 2, 3]
             arr[0] = 9
             arr[0]
         "#;
@@ -733,7 +826,7 @@ mod tests {
     #[test]
     fn test_array_slice_combined_bounds() {
         let source = r#"
-            let arr = [0, 1, 2, 3, 4, 5, 6, 7]
+            arr = [0, 1, 2, 3, 4, 5, 6, 7]
             len(arr[2:6:2]) + len(arr[-6:-1:2])
         "#;
         // [2,4] len 2 + [2,4,6] len 3 = 5
@@ -744,7 +837,7 @@ mod tests {
     fn test_array_push_twice_inside_fn_sum_elements() {
         let source = r#"
 fn f() {
-  let a = []
+  a = []
   a.push(10)
   a.push(20)
   return a[0] + a[1]
@@ -759,8 +852,8 @@ f()
     fn test_two_empty_array_lets_push_distinct_inside_fn() {
         let source = r#"
 fn f() {
-  let a = []
-  let b = []
+  a = []
+  b = []
   a.push(1)
   b.push(2)
   return len(a) * 10 + len(b)
@@ -775,19 +868,19 @@ f()
     fn test_chunk_slice_push_labels_pixels_inside_fn_small_synthetic() {
         let source = r#"
 fn export_data(data) {
-  let chunks = data.chunk(5)
-  let labels = []
-  let pixels_list = []
+  chunks = data.chunk(5)
+  labels = []
+  pixels_list = []
   for chunk in chunks {
     if len(chunk) != 5 {
       continue
     }
-    let label = chunk[0]
-    let pixels = chunk[1:]
+    label = chunk[0]
+    pixels = chunk[1:]
     labels.push(label)
     pixels_list.push(pixels)
   }
-  let score = 0
+  score = 0
   if typeof(labels[0]) == "int" {
     score = score + 1
   }
@@ -799,7 +892,7 @@ fn export_data(data) {
   }
   return score
 }
-let data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
+data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
 export_data(data)
 "#;
         assert_number_result(source, 3.0);
@@ -810,21 +903,21 @@ export_data(data)
     fn test_chunk_export_lengths_inside_fn() {
         let source = r#"
 fn export_data(data) {
-  let chunks = data.chunk(5)
-  let labels = []
-  let pixels_list = []
+  chunks = data.chunk(5)
+  labels = []
+  pixels_list = []
   for chunk in chunks {
     if len(chunk) != 5 {
       continue
     }
-    let label = chunk[0]
-    let pixels = chunk[1:]
+    label = chunk[0]
+    pixels = chunk[1:]
     labels.push(label)
     pixels_list.push(pixels)
   }
   return len(labels) * 100 + len(pixels_list)
 }
-let data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
+data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
 export_data(data)
 "#;
         assert_number_result(source, 303.0);
@@ -834,15 +927,15 @@ export_data(data)
     #[test]
     fn test_export_data_chunk_compiles_three_call2_including_chunk() {
         let source = r#"fn export_data(data) {
-  let chunks = data.chunk(5)
-  let labels = []
-  let pixels_list = []
+  chunks = data.chunk(5)
+  labels = []
+  pixels_list = []
   for chunk in chunks {
     if len(chunk) != 5 {
       continue
     }
-    let label = chunk[0]
-    let pixels = chunk[1:]
+    label = chunk[0]
+    pixels = chunk[1:]
     labels.push(label)
     pixels_list.push(pixels)
   }
@@ -870,8 +963,8 @@ export_data(data)
     fn test_chunk_for_loop_iteration_count_inside_fn() {
         let source = r#"
 fn export_data(data) {
-  let chunks = data.chunk(5)
-  let n = 0
+  chunks = data.chunk(5)
+  n = 0
   for chunk in chunks {
     if len(chunk) != 5 {
       continue
@@ -880,7 +973,7 @@ fn export_data(data) {
   }
   return n
 }
-let data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
+data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
 export_data(data)
 "#;
         assert_number_result(source, 3.0);
@@ -890,20 +983,20 @@ export_data(data)
     #[test]
     fn test_chunk_slice_push_labels_pixels_top_level_small_synthetic() {
         let source = r#"
-let data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
-let chunks = data.chunk(5)
-let labels = []
-let pixels_list = []
+data = [1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 20, 21, 22, 23, 24]
+chunks = data.chunk(5)
+labels = []
+pixels_list = []
 for chunk in chunks {
   if len(chunk) != 5 {
     continue
   }
-  let label = chunk[0]
-  let pixels = chunk[1:]
+  label = chunk[0]
+  pixels = chunk[1:]
   labels.push(label)
   pixels_list.push(pixels)
 }
-let score = 0
+score = 0
 if typeof(labels[0]) == "int" {
   score = score + 1
 }

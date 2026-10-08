@@ -8,17 +8,15 @@ pub fn start_websocket_server(config: WebSocketConfig) -> Result<(), String> {
 
     println!("🚀 Запуск WebSocket сервера DataCode...");
     println!("📡 Адрес: ws://{}", address);
-    if config.use_ve {
-        println!("📁 Режим виртуальной среды: включен (--use-ve)");
+    if let Some(ref app) = config.app_file {
+        println!("📜 ws_app: {}", app);
     }
     if config.build_model {
-        println!("🗄️  Режим экспорта SQLite: включен (--build_model)");
+        println!("🗄️  SQLite export mode: enabled (--build_model)");
     }
-    println!("💡 Используйте --host и --port для изменения адреса");
-    println!("💡 Или переменную окружения DATACODE_WS_ADDRESS");
+    println!("💡 Send a binary WebSocket frame with a DCP package (.dcp bytes)");
     println!();
 
-    // Create tokio runtime for async execution
     let rt = tokio::runtime::Runtime::new()
         .map_err(|e| format!("Failed to create tokio runtime: {}", e))?;
 
@@ -26,6 +24,8 @@ pub fn start_websocket_server(config: WebSocketConfig) -> Result<(), String> {
         &address,
         config.use_ve,
         config.build_model,
+        config.app_file.as_deref(),
+        config.base_dir.as_deref(),
     ))
     .map_err(|e| format!("Ошибка запуска WebSocket сервера: {}", e))
 }

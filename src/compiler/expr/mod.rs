@@ -3,14 +3,20 @@ pub mod assign;
 pub mod binary;
 pub mod call;
 pub mod call_value;
+pub mod dict_comp;
+pub mod if_expr;
+pub mod list_comp;
 /// Модуль компиляции выражений
+pub mod integral_peephole;
 pub mod interpolated;
 pub mod lambda;
 pub mod literal;
 pub mod method_call;
+pub mod object_literal;
 pub mod property;
 pub mod super_expr;
 pub mod this;
+pub mod table_filter;
 pub mod unary;
 pub mod variable;
 
@@ -41,12 +47,34 @@ pub fn compile_expr(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), Lan
         | Expr::AssignOp { .. }
         | Expr::AssignArray { .. }
         | Expr::AssignArrayOp { .. }
+        | Expr::AssignTableColumn { .. }
         | Expr::UnpackAssign { .. } => assign::compile_assign(ctx, expr),
         Expr::Unary { .. } => unary::compile_unary(ctx, expr),
         Expr::Binary { .. } => binary::compile_binary(ctx, expr),
         Expr::Call { .. } => call::compile_call(ctx, expr),
         Expr::CallValue { .. } => call_value::compile_call_value(ctx, expr),
         Expr::Lambda { .. } => lambda::compile_lambda(ctx, expr),
+        Expr::DictComprehension {
+            key_expr,
+            value_expr,
+            loop_var,
+            iterable,
+            condition,
+            line,
+        } => dict_comp::compile_dict_comprehension(
+            ctx,
+            key_expr,
+            value_expr,
+            loop_var,
+            iterable,
+            condition.as_deref(),
+            *line,
+        ),
+        Expr::ListComprehension {
+            elt,
+            clauses,
+            line,
+        } => list_comp::compile_list_comprehension(ctx, elt.as_ref(), clauses, *line),
         Expr::ArrayLiteral { .. }
         | Expr::TupleLiteral { .. }
         | Expr::ObjectLiteral { .. }
@@ -59,6 +87,7 @@ pub fn compile_expr(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), Lan
         Expr::SuperCall { .. } => super_expr::compile_super_call(ctx, expr),
         Expr::SuperMethodCall { .. } => super_expr::compile_super_method_call(ctx, expr),
         Expr::InterpolatedString { .. } => interpolated::compile_interpolated_string(ctx, expr),
+        Expr::If { .. } => if_expr::compile_if_expr(ctx, expr),
         Expr::ExprReturn { line, .. } => Err(LangError::ParseError {
             message:
                 "`return` as an expression is only compiled inside stream fn (e.g. x = return ...)"
@@ -68,6 +97,12 @@ pub fn compile_expr(ctx: &mut CompilationContext, expr: &Expr) -> Result<(), Lan
         }),
         Expr::Ireturn { line, .. } => Err(LangError::ParseError {
             message: "`ireturn` is only compiled inside stream fn body".to_string(),
+            line: *line,
+            file: ctx.source_name.map(|s| s.to_string()),
+        }),
+        Expr::TableColumnWrite { line, .. } => Err(LangError::ParseError {
+            message: "table column write (`orders![\"col\"]`) is only valid as an assignment target"
+                .to_string(),
             line: *line,
             file: ctx.source_name.map(|s| s.to_string()),
         }),

@@ -23,10 +23,8 @@ mod tests {
     fn assert_number_result(source: &str, expected: f64) {
         let result = run_and_get_result(source);
         match result {
-            Ok(Value::Number(n)) => {
-                assert_eq!(n, expected, "Expected {}, got {}", expected, n);
-            }
-            Ok(v) => panic!("Expected Number({}), got {:?}", expected, v),
+            Ok(v) if v.as_ieee_f64() == Some(expected) => {}
+            Ok(v) => panic!("Expected numeric({}), got {:?}", expected, v),
             Err(e) => panic!("Error: {:?}", e),
         }
     }
@@ -256,16 +254,16 @@ mod tests {
         );
     }
 
-    /// `read_file_bin` returns `ByteBuffer`; it must satisfy `: array` like `Array` / `ArrayView`.
+    /// `read` returns `ByteBuffer`; it must satisfy `: array` like `Array` / `ArrayView`.
     #[test]
-    fn test_array_function_accepts_read_file_bin_bytebuffer() {
+    fn test_array_function_accepts_read_bytebuffer() {
         let bin_path = get_test_data_path("read_file_bin_sample.bin");
         let source = format!(
             r#"
             fn array_len(arr: array) -> int {{
                 return len(arr)
             }}
-            array_len(read_file_bin("{}"))
+            array_len(read("{}"))
             "#,
             bin_path
         );

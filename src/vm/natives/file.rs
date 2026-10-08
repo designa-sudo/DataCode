@@ -1,7 +1,7 @@
 // File operations native functions
 
 use crate::common::value::Value;
-use chrono::Utc;
+use chrono::{FixedOffset, Utc};
 use regex::Regex;
 use std::cell::RefCell;
 use std::env;
@@ -10,10 +10,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 pub fn native_now(_args: &[Value]) -> Value {
-    // Возвращаем текущее время в формате RFC3339 (ISO 8601)
-    // Формат: YYYY-MM-DDTHH:MM:SSZ
-    let now = Utc::now();
-    Value::String(now.format("%Y-%m-%dT%H:%M:%SZ").to_string())
+    Value::Date(Utc::now().with_timezone(&FixedOffset::east_opt(0).expect("offset")))
 }
 
 pub fn native_getcwd(_args: &[Value]) -> Value {
@@ -34,6 +31,12 @@ pub fn native_getcwd(_args: &[Value]) -> Value {
 /// Безопасное форматирование пути для сообщений об ошибках
 /// В режиме --use-ve преобразует полный путь в относительный
 pub fn format_path_for_error(path: &PathBuf) -> String {
+    if crate::dcp::dcp_vfs_active() {
+        if let Ok(key) = crate::dcp::normalize_vfs_path(path) {
+            return crate::dcp::format_logical_path(&key);
+        }
+    }
+
     use crate::websocket::{get_use_ve, get_user_session_path};
 
     if get_use_ve() {
@@ -74,13 +77,36 @@ pub fn format_path_for_error(path: &PathBuf) -> String {
     }
 }
 
+/// Resolve a relative path against script `base_path`, VM base, or cwd (outside --use-ve).
+fn resolve_relative_to_base(path: &PathBuf) -> PathBuf {
+    if path.is_absolute() {
+        return path.clone();
+    }
+    if let Some(base) = crate::vm::file_import::get_base_path() {
+        return base.join(path);
+    }
+    if let Some(base) = crate::vm::vm::current_vm_ptr()
+        .and_then(|ptr| unsafe { (*ptr).get_base_path().clone() })
+    {
+        return base.join(path);
+    }
+    if let Ok(cwd) = env::current_dir() {
+        return cwd.join(path);
+    }
+    path.clone()
+}
+
 /// Безопасное разрешение пути относительно папки сессии в режиме --use-ve
 pub fn resolve_path_in_session(path: &PathBuf) -> Result<PathBuf, String> {
+    if crate::dcp::dcp_vfs_active() {
+        let key = crate::dcp::normalize_vfs_path(path).map_err(|e| e.to_string())?;
+        return Ok(crate::dcp::logical_path_to_pathbuf(&key));
+    }
+
     use crate::websocket::{get_use_ve, get_user_session_path};
 
     if !get_use_ve() {
-        // В обычном режиме просто возвращаем путь как есть
-        return Ok(path.clone());
+        return Ok(resolve_relative_to_base(path));
     }
 
     let session_path = match get_user_session_path() {
@@ -312,6 +338,10 @@ fn list_files_recursive(
     regex: Option<&Regex>,
     session_path: &PathBuf,
 ) -> Vec<Value> {
+    if let Some(vfs) = crate::dcp::get_dcp_vfs() {
+        return list_files_vfs(dir, regex, &vfs);
+    }
+
     let mut files = Vec::new();
 
     // Проверяем безопасность пути в режиме --use-ve
@@ -394,6 +424,53 @@ fn list_files_recursive(
     files
 }
 
+fn list_files_vfs(dir: &PathBuf, regex: Option<&Regex>, vfs: &crate::dcp::DcpVfs) -> Vec<Value> {
+    let prefix = match resolve_path_in_session(dir) {
+        Ok(p) => crate::dcp::normalize_vfs_path(&p).unwrap_or_default(),
+        Err(_) => return Vec::new(),
+    };
+
+    if !prefix.is_empty() && !vfs.is_dir(&prefix) {
+        if vfs.contains_file(&prefix) {
+            return vec![Value::Path(crate::dcp::logical_path_to_pathbuf(&prefix))];
+        }
+        return Vec::new();
+    }
+
+    let mut files = Vec::new();
+    list_files_vfs_recursive(&prefix, regex, vfs, &mut files);
+    files
+}
+
+fn list_files_vfs_recursive(
+    prefix: &str,
+    regex: Option<&Regex>,
+    vfs: &crate::dcp::DcpVfs,
+    out: &mut Vec<Value>,
+) {
+    for child_path in vfs.list_dir_paths(prefix) {
+        let key = crate::dcp::normalize_vfs_path(&child_path).unwrap_or_default();
+        let name = child_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("");
+        if name.starts_with('.') || name == ".DS_Store" {
+            continue;
+        }
+
+        if vfs.contains_file(&key) {
+            if regex.as_ref().is_none_or(|re| re.is_match(name)) {
+                out.push(Value::Path(child_path));
+            }
+        } else if vfs.is_dir(&key) {
+            if regex.as_ref().is_none_or(|re| re.is_match(name)) {
+                out.push(Value::Path(child_path.clone()));
+            }
+            list_files_vfs_recursive(&key, regex, vfs, out);
+        }
+    }
+}
+
 pub fn native_list_files(args: &[Value]) -> Value {
     if args.is_empty() {
         return Value::Array(Rc::new(RefCell::new(Vec::new())));
@@ -446,23 +523,23 @@ pub fn native_list_files(args: &[Value]) -> Value {
 
     // Проверяем, является ли это SMB путем (lib://)
     if dir_path_str.starts_with("lib://") {
-        // Извлекаем имя шары и путь к директории
-        let path_without_prefix = &dir_path_str[6..]; // Убираем "lib://"
-        let parts: Vec<&str> = path_without_prefix.splitn(2, '/').collect();
-
-        if parts.is_empty() {
-            return Value::Array(Rc::new(RefCell::new(Vec::new())));
-        }
-
-        let share_name = parts[0];
-        let dir_path_on_share = if parts.len() > 1 { parts[1] } else { "" };
+        let (share_name, dir_path_on_share) = match crate::file_io::parse_lib_smb_path(
+            &dir_path_str,
+        ) {
+            Ok(parts) => parts,
+            Err(err_msg) => {
+                use crate::websocket::set_native_error;
+                set_native_error(err_msg);
+                return Value::Array(Rc::new(RefCell::new(Vec::new())));
+            }
+        };
 
         // Получаем SmbManager из thread-local storage; hold lock only for list_files, then release before building result.
         if let Some(smb_manager) = crate::vm::file_ops::get_smb_manager() {
             let regex_str = regex_pattern.as_deref();
             let list_result = {
                 let guard = smb_manager.lock().unwrap();
-                guard.list_files(share_name, dir_path_on_share, regex_str, true)
+                guard.list_files(&share_name, &dir_path_on_share, regex_str, true)
             };
             match list_result {
                 Ok(files) => {
@@ -527,20 +604,21 @@ pub fn native_read_file_bin(args: &[Value]) -> Value {
     let file_path_str = file_path.to_string_lossy().to_string();
 
     if file_path_str.starts_with("lib://") {
-        let path_without_prefix = &file_path_str[6..];
-        let parts: Vec<&str> = path_without_prefix.splitn(2, '/').collect();
-
-        if parts.is_empty() {
-            return Value::Null;
-        }
-
-        let share_name = parts[0];
-        let file_path_on_share = if parts.len() > 1 { parts[1] } else { "" };
+        let (share_name, file_path_on_share) = match crate::file_io::parse_lib_smb_path(
+            &file_path_str,
+        ) {
+            Ok(parts) => parts,
+            Err(err_msg) => {
+                use crate::websocket::set_native_error;
+                set_native_error(err_msg);
+                return Value::Null;
+            }
+        };
 
         if let Some(smb_manager) = crate::vm::file_ops::get_smb_manager() {
             let read_result = {
                 let guard = smb_manager.lock().unwrap();
-                guard.read_file(share_name, file_path_on_share)
+                guard.read_file(&share_name, &file_path_on_share)
             };
             match read_result {
                 Ok(content) => {
@@ -552,38 +630,11 @@ pub fn native_read_file_bin(args: &[Value]) -> Value {
             Value::Null
         }
     } else {
-        let resolved_path = match resolve_path_in_session(&file_path) {
-            Ok(p) => p,
+        match crate::file_io::read_bytes_from_path(&file_path) {
+            Ok(content) => Value::ByteBuffer(crate::common::value::ByteBuffer::from_vec(content)),
             Err(err_msg) => {
                 use crate::websocket::set_native_error;
-                set_native_error(format!("Path resolution error: {}", err_msg));
-                return Value::Null;
-            }
-        };
-
-        if !resolved_path.exists() {
-            use crate::websocket::set_native_error;
-            set_native_error(format!(
-                "File does not exist: {}",
-                format_path_for_error(&resolved_path)
-            ));
-            return Value::Null;
-        }
-
-        if !resolved_path.is_file() {
-            use crate::websocket::set_native_error;
-            set_native_error(format!(
-                "Path is not a file: {}",
-                format_path_for_error(&resolved_path)
-            ));
-            return Value::Null;
-        }
-
-        match fs::read(&resolved_path) {
-            Ok(content) => Value::ByteBuffer(crate::common::value::ByteBuffer::from_vec(content)),
-            Err(e) => {
-                use crate::websocket::set_native_error;
-                set_native_error(format!("Error reading file: {}", e));
+                set_native_error(err_msg);
                 Value::Null
             }
         }
